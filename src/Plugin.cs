@@ -11,7 +11,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "andrewpalww.dontpullme.moreplayers";
     public const string PluginName = "Dont Pull Me More Players";
-    public const string PluginVersion = "1.0.4";
+    public const string PluginVersion = "1.0.5";
     public const int MaxPlayers = 8;
 
     internal static ManualLogSource? ModLog;
@@ -29,9 +29,10 @@ public sealed class Plugin : BasePlugin
         patched += PatchLobbyData(_harmony);
         patched += PatchSteamMatchmaking(_harmony);
         patched += PatchFishySteamworks(_harmony);
+        patched += PatchRopeSystem(_harmony);
 
         Log.LogInfo($"{PluginName}: installed {patched} Harmony patches.");
-        Log.LogInfo("v1.0.4 uses direct ref-int argument patches and lobby-full bypasses for 5-8 player sessions.");
+        Log.LogInfo("v1.0.5 adds dynamic RopeStack expansion for 5-8 player sessions.");
     }
 
     private static int PatchLobbyManager(Harmony harmony)
@@ -118,7 +119,8 @@ public sealed class Plugin : BasePlugin
     {
         int count = 0;
         foreach (Type type in FindTypes(t =>
-                     t.FullName?.StartsWith("FishySteamworks", StringComparison.OrdinalIgnoreCase) == true))
+                     t.FullName?.StartsWith("FishySteamworks", StringComparison.OrdinalIgnoreCase) == true &&
+                     !(t.IsInterface)))
         {
             foreach (MethodInfo method in DeclaredMethods(type))
             {
@@ -136,6 +138,29 @@ public sealed class Plugin : BasePlugin
                 {
                     count += Patch(harmony, method, postfixName: nameof(Patches.MinimumEightResult));
                 }
+            }
+        }
+        return count;
+    }
+
+
+    private static int PatchRopeSystem(Harmony harmony)
+    {
+        int count = 0;
+        foreach (Type type in FindTypes(t =>
+                     t.FullName == "GameAssets.Scripts.Managers.RopeManagerFishnet"))
+        {
+            foreach (MethodInfo method in DeclaredMethods(type))
+            {
+                if (method.Name == "HandleServerCharacterSpawned")
+                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterPlayerSpawn));
+                else if (method.Name == "RebuildRopeChain")
+                    count += Patch(harmony, method, prefixName: nameof(Patches.RopeManagerBeforeRebuild),
+                                                   postfixName: nameof(Patches.RopeManagerAfterRebuild));
+                else if (method.Name == "SceneManager_OnLoadEnd")
+                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterSceneLoad));
+                else if (method.Name == "DelayedRopeSetup")
+                    count += Patch(harmony, method, prefixName: nameof(Patches.RopeManagerBeforeDelayedSetup));
             }
         }
         return count;
@@ -267,4 +292,250 @@ internal static class Patches
             Plugin.ModLog?.LogInfo("FORCED lobby Full result: true -> false");
         }
     }
+
+    // ---- Rope extension for players 5-8 ------------------------------------
+    // Dont Pull Me keeps its rope visuals/physics in RopeStack arrays.
+    // The stock prefab is sized for the original party.  Before the game rebuilds
+    // the chain we clone the final stock segment until both arrays have room for 8.
+    public static void RopeManagerAfterPlayerSpawn(object __instance)
+        => PrepareRopeManager(__instance, "player-spawn");
+
+    public static void RopeManagerBeforeRebuild(object __instance)
+        => PrepareRopeManager(__instance, "before-rebuild");
+
+    public static void RopeManagerAfterRebuild(object __instance)
+        => LogRopeState(__instance, "after-rebuild");
+
+    public static void RopeManagerAfterSceneLoad(object __instance)
+        => PrepareRopeManager(__instance, "scene-load");
+
+    public static void RopeManagerBeforeDelayedSetup(object __instance)
+        => PrepareRopeManager(__instance, "delayed-setup");
+
+    private static void PrepareRopeManager(object manager, string reason)
+    {
+        try
+        {
+            int players = GetCollectionCount(GetMember(manager, "_players"));
+            if (players > 0)
+                Plugin.ModLog?.LogInfo($"ROPE {reason}: players={players}");
+
+            // Do not touch the original 1-4 player behaviour.
+            if (players <= 4) return;
+
+            object? template = GetMember(manager, "ropeStack");
+            object? current = GetMember(manager, "_currentRopeStack");
+
+            if (template != null) EnsureStackCapacity(template, "template");
+            if (current != null && !ReferenceEquals(current, template))
+                EnsureStackCapacity(current, "current");
+        }
+        catch (Exception ex)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE {reason}: capacity preparation failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void LogRopeState(object manager, string reason)
+    {
+        try
+        {
+            int players = GetCollectionCount(GetMember(manager, "_players"));
+            object? current = GetMember(manager, "_currentRopeStack");
+            int ropes = current == null ? -1 : GetArrayLength(GetMember(current, "ropes"));
+            int edges = current == null ? -1 : GetArrayLength(GetMember(current, "ropeEdgeColliders"));
+            Plugin.ModLog?.LogInfo($"ROPE {reason}: players={players}, currentRopes={ropes}, edgeColliders={edges}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE {reason}: state logging failed: {ex.Message}");
+        }
+    }
+
+    private static void EnsureStackCapacity(object stack, string label)
+    {
+        ExpandReferenceArrayMember(stack, "ropes", Plugin.MaxPlayers, label);
+        ExpandReferenceArrayMember(stack, "ropeEdgeColliders", Plugin.MaxPlayers, label);
+    }
+
+    private static void ExpandReferenceArrayMember(object owner, string memberName, int targetLength, string label)
+    {
+        object? array = GetMember(owner, memberName);
+        if (array == null) return;
+
+        int oldLength = GetArrayLength(array);
+        if (oldLength <= 0 || oldLength >= targetLength) return;
+
+        Type arrayType = array.GetType();
+        MethodInfo? getter = arrayType.GetMethod("get_Item", BindingFlags.Public | BindingFlags.Instance);
+        MethodInfo? setter = arrayType.GetMethod("set_Item", BindingFlags.Public | BindingFlags.Instance);
+        if (getter == null || setter == null)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: array indexer not found ({arrayType.FullName}).");
+            return;
+        }
+
+        object? source = null;
+        for (int i = oldLength - 1; i >= 0 && source == null; --i)
+            source = getter.Invoke(array, new object[] { i });
+        if (source == null)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: no source element to clone.");
+            return;
+        }
+
+        object? expanded = CreateIl2CppArray(arrayType, targetLength);
+        if (expanded == null)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: could not allocate {arrayType.FullName}[{targetLength}].");
+            return;
+        }
+
+        for (int i = 0; i < oldLength; ++i)
+            setter.Invoke(expanded, new object?[] { i, getter.Invoke(array, new object[] { i }) });
+
+        for (int i = oldLength; i < targetLength; ++i)
+        {
+            object? clone = CloneUnityObject(source);
+            if (clone == null)
+            {
+                Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: clone failed at index {i}; keeping source reference as fallback.");
+                clone = source;
+            }
+            setter.Invoke(expanded, new object?[] { i, clone });
+            source = clone;
+        }
+
+        if (SetMember(owner, memberName, expanded))
+            Plugin.ModLog?.LogInfo($"ROPE EXPANDED {label}.{memberName}: {oldLength} -> {targetLength}");
+        else
+            Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: expanded array could not be assigned.");
+    }
+
+    private static object? CreateIl2CppArray(Type arrayType, int length)
+    {
+        foreach (ConstructorInfo ctor in arrayType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            ParameterInfo[] p = ctor.GetParameters();
+            if (p.Length != 1) continue;
+            try
+            {
+                if (p[0].ParameterType == typeof(int)) return ctor.Invoke(new object[] { length });
+                if (p[0].ParameterType == typeof(long)) return ctor.Invoke(new object[] { (long)length });
+                if (p[0].ParameterType == typeof(nint)) continue; // pointer constructor, not a length constructor
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static object? CloneUnityObject(object original)
+    {
+        try
+        {
+            Type? unityObject = FindLoadedType("UnityEngine.Object");
+            if (unityObject == null) return null;
+
+            object? parent = null;
+            PropertyInfo? transformProp = original.GetType().GetProperty("transform", BindingFlags.Public | BindingFlags.Instance);
+            object? transform = transformProp?.GetValue(original);
+            if (transform != null)
+                parent = transform.GetType().GetProperty("parent", BindingFlags.Public | BindingFlags.Instance)?.GetValue(transform);
+
+            MethodInfo? instantiate2 = unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => !m.IsGenericMethodDefinition && m.Name == "Instantiate" &&
+                                     m.GetParameters().Length == 2 &&
+                                     m.GetParameters()[0].ParameterType.FullName == "UnityEngine.Object" &&
+                                     m.GetParameters()[1].ParameterType.FullName == "UnityEngine.Transform");
+            if (instantiate2 != null && parent != null)
+                return instantiate2.Invoke(null, new[] { original, parent });
+
+            MethodInfo? instantiate1 = unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => !m.IsGenericMethodDefinition && m.Name == "Instantiate" &&
+                                     m.GetParameters().Length == 1 &&
+                                     m.GetParameters()[0].ParameterType.FullName == "UnityEngine.Object");
+            return instantiate1?.Invoke(null, new[] { original });
+        }
+        catch (Exception ex)
+        {
+            Plugin.ModLog?.LogWarning($"ROPE clone failed: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static Type? FindLoadedType(string fullName)
+    {
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                Type? direct = assembly.GetType(fullName, false);
+                if (direct != null) return direct;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static object? GetMember(object owner, string name)
+    {
+        Type t = owner.GetType();
+        try
+        {
+            PropertyInfo? p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            if (p != null && p.CanRead) return p.GetValue(owner);
+        }
+        catch { }
+        try
+        {
+            FieldInfo? f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            if (f != null) return f.GetValue(owner);
+        }
+        catch { }
+        return null;
+    }
+
+    private static bool SetMember(object owner, string name, object value)
+    {
+        Type t = owner.GetType();
+        try
+        {
+            PropertyInfo? p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            if (p != null && p.CanWrite) { p.SetValue(owner, value); return true; }
+        }
+        catch { }
+        try
+        {
+            FieldInfo? f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            if (f != null) { f.SetValue(owner, value); return true; }
+        }
+        catch { }
+        return false;
+    }
+
+    private static int GetCollectionCount(object? collection)
+    {
+        if (collection == null) return 0;
+        try
+        {
+            object? value = collection.GetType().GetProperty("Count", BindingFlags.Public | BindingFlags.Instance)?.GetValue(collection);
+            if (value is int i) return i;
+        }
+        catch { }
+        return 0;
+    }
+
+    private static int GetArrayLength(object? array)
+    {
+        if (array == null) return -1;
+        try
+        {
+            object? value = array.GetType().GetProperty("Length", BindingFlags.Public | BindingFlags.Instance)?.GetValue(array);
+            if (value is int i) return i;
+            if (value is long l) return checked((int)l);
+        }
+        catch { }
+        return -1;
+    }
+
 }
