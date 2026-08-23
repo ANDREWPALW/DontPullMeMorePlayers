@@ -11,7 +11,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "andrewpalww.dontpullme.moreplayers";
     public const string PluginName = "Dont Pull Me More Players";
-    public const string PluginVersion = "1.0.3";
+    public const string PluginVersion = "1.0.4";
     public const int MaxPlayers = 8;
 
     internal static ManualLogSource? ModLog;
@@ -26,31 +26,65 @@ public sealed class Plugin : BasePlugin
         int patched = 0;
 
         patched += PatchLobbyManager(_harmony);
+        patched += PatchLobbyData(_harmony);
         patched += PatchSteamMatchmaking(_harmony);
         patched += PatchFishySteamworks(_harmony);
 
         Log.LogInfo($"{PluginName}: installed {patched} Harmony patches.");
-        if (patched == 0)
-            Log.LogWarning("No target methods were found. Please send BepInEx/LogOutput.log to the mod author.");
+        Log.LogInfo("v1.0.4 uses direct ref-int argument patches and lobby-full bypasses for 5-8 player sessions.");
     }
 
     private static int PatchLobbyManager(Harmony harmony)
     {
         int count = 0;
-        foreach (Type type in FindTypes(t =>
-                     t.FullName == "Heathen.SteamworksIntegration.LobbyManager" ||
-                     (t.Name == "LobbyManager" && (t.Namespace?.Contains("Heathen", StringComparison.OrdinalIgnoreCase) ?? false))))
+        foreach (Type type in FindTypes(t => t.FullName == "Heathen.SteamworksIntegration.LobbyManager"))
         {
             foreach (MethodInfo method in DeclaredMethods(type))
             {
-                if (method.Name == "Create" && method.GetParameters().Any(p => p.ParameterType == typeof(int)))
-                    count += Patch(harmony, method, nameof(Patches.ForceEightInIntArguments));
+                if (method.Name == "Create")
+                {
+                    int idx = FindIntParameter(method);
+                    if (idx >= 0)
+                        count += PatchIntArgument(harmony, method, idx);
+                }
+                else if (method.Name == "set_MaxMembers" && HasSingleIntParameter(method))
+                {
+                    count += PatchIntArgument(harmony, method, 0);
+                }
+                else if (method.Name == "get_MaxMembers" && method.ReturnType == typeof(int))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.MinimumEightResult));
+                }
+                else if (method.Name == "get_Full" && method.ReturnType == typeof(bool))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.ForceNotFull));
+                }
+            }
+        }
+        return count;
+    }
 
-                if (method.Name == "set_MaxMembers" && HasSingleIntParameter(method))
-                    count += Patch(harmony, method, nameof(Patches.ForceEightInIntArguments));
-
-                if (method.Name == "get_MaxMembers" && method.ReturnType == typeof(int))
-                    count += Patch(harmony, method, null, nameof(Patches.MinimumEightResult));
+    private static int PatchLobbyData(Harmony harmony)
+    {
+        int count = 0;
+        foreach (Type type in FindTypes(t => t.FullName == "Heathen.SteamworksIntegration.LobbyData"))
+        {
+            foreach (MethodInfo method in DeclaredMethods(type))
+            {
+                if (method.Name == "CreatePrivateSession")
+                {
+                    int idx = FindIntParameter(method);
+                    if (idx >= 0)
+                        count += PatchIntArgument(harmony, method, idx);
+                }
+                else if (method.Name == "get_MaxMembers" && method.ReturnType == typeof(int))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.MinimumEightResult));
+                }
+                else if (method.Name == "get_Full" && method.ReturnType == typeof(bool))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.ForceNotFull));
+                }
             }
         }
         return count;
@@ -65,10 +99,15 @@ public sealed class Plugin : BasePlugin
         {
             foreach (MethodInfo method in DeclaredMethods(type))
             {
-                if ((method.Name == "CreateLobby" || method.Name == "SetLobbyMemberLimit") &&
-                    method.GetParameters().Any(p => p.ParameterType == typeof(int)))
+                if (method.Name == "CreateLobby" || method.Name == "SetLobbyMemberLimit")
                 {
-                    count += Patch(harmony, method, nameof(Patches.ForceEightInIntArguments));
+                    int idx = FindIntParameter(method);
+                    if (idx >= 0)
+                        count += PatchIntArgument(harmony, method, idx);
+                }
+                else if (method.Name == "GetLobbyMemberLimit" && method.ReturnType == typeof(int))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.MinimumEightResult));
                 }
             }
         }
@@ -84,44 +123,70 @@ public sealed class Plugin : BasePlugin
             foreach (MethodInfo method in DeclaredMethods(type))
             {
                 if (method.Name == "SetMaximumClients" && HasSingleIntParameter(method))
-                    count += Patch(harmony, method, nameof(Patches.ForceEightInIntArguments));
-
-                // Server-side overload in this game is (string address, ushort port, int maximumClients, bool peerToPeer).
-                // Client overloads do not contain an Int32 maximum-clients parameter, so they are ignored.
-                if (method.Name == "StartConnection" &&
-                    method.GetParameters().Length >= 4 &&
-                    method.GetParameters().Any(p => p.ParameterType == typeof(int)))
                 {
-                    count += Patch(harmony, method, nameof(Patches.ForceEightInIntArguments));
+                    count += PatchIntArgument(harmony, method, 0);
                 }
-
-                if (method.Name == "GetMaximumClients" && method.ReturnType == typeof(int))
-                    count += Patch(harmony, method, null, nameof(Patches.MinimumEightResult));
+                else if (method.Name == "StartConnection")
+                {
+                    int idx = FindIntParameter(method);
+                    if (idx >= 0)
+                        count += PatchIntArgument(harmony, method, idx);
+                }
+                else if (method.Name == "GetMaximumClients" && method.ReturnType == typeof(int))
+                {
+                    count += Patch(harmony, method, postfixName: nameof(Patches.MinimumEightResult));
+                }
             }
         }
         return count;
+    }
+
+    private static int PatchIntArgument(Harmony harmony, MethodInfo target, int intIndex)
+    {
+        string? prefix = intIndex switch
+        {
+            0 => nameof(Patches.ForceInt0),
+            1 => nameof(Patches.ForceInt1),
+            2 => nameof(Patches.ForceInt2),
+            3 => nameof(Patches.ForceInt3),
+            _ => null
+        };
+
+        if (prefix is null)
+        {
+            ModLog?.LogWarning($"Cannot patch int argument #{intIndex} for {FormatMethod(target)}.");
+            return 0;
+        }
+
+        return Patch(harmony, target, prefixName: prefix);
     }
 
     private static int Patch(Harmony harmony, MethodInfo target, string? prefixName = null, string? postfixName = null)
     {
         try
         {
-            HarmonyMethod? prefix = prefixName is null
-                ? null
-                : new HarmonyMethod(AccessTools.Method(typeof(Patches), prefixName));
-            HarmonyMethod? postfix = postfixName is null
-                ? null
-                : new HarmonyMethod(AccessTools.Method(typeof(Patches), postfixName));
-
+            HarmonyMethod? prefix = prefixName is null ? null : new HarmonyMethod(AccessTools.Method(typeof(Patches), prefixName));
+            HarmonyMethod? postfix = postfixName is null ? null : new HarmonyMethod(AccessTools.Method(typeof(Patches), postfixName));
             harmony.Patch(target, prefix: prefix, postfix: postfix);
-            ModLog?.LogInfo($"Patched {target.DeclaringType?.FullName}.{target.Name}({string.Join(", ", target.GetParameters().Select(p => p.ParameterType.Name))})");
+            ModLog?.LogInfo($"Patched {FormatMethod(target)}");
             return 1;
         }
         catch (Exception ex)
         {
-            ModLog?.LogWarning($"Failed to patch {target.DeclaringType?.FullName}.{target.Name}: {ex.GetType().Name}: {ex.Message}");
+            ModLog?.LogWarning($"Failed to patch {FormatMethod(target)}: {ex.GetType().Name}: {ex.Message}");
             return 0;
         }
+    }
+
+    private static string FormatMethod(MethodInfo target) =>
+        $"{target.DeclaringType?.FullName}.{target.Name}({string.Join(", ", target.GetParameters().Select(p => p.ParameterType.Name))})";
+
+    private static int FindIntParameter(MethodInfo method)
+    {
+        ParameterInfo[] p = method.GetParameters();
+        for (int i = 0; i < p.Length; i++)
+            if (p[i].ParameterType == typeof(int)) return i;
+        return -1;
     }
 
     private static bool HasSingleIntParameter(MethodInfo method)
@@ -155,34 +220,51 @@ public sealed class Plugin : BasePlugin
     {
         try
         {
-            return type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
+            return type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic |
+                                   BindingFlags.Instance | BindingFlags.Static |
+                                   BindingFlags.DeclaredOnly);
         }
-        catch
-        {
-            return Array.Empty<MethodInfo>();
-        }
+        catch { return Array.Empty<MethodInfo>(); }
     }
 }
 
 internal static class Patches
 {
-    // Harmony's __args array allows argument replacement without compile-time references
-    // to Dont Pull Me's IL2CPP interop assemblies.
-    public static void ForceEightInIntArguments(object[] __args)
+    private static void Raise(ref int value, string argument)
     {
-        for (int i = 0; i < __args.Length; i++)
+        if (value < Plugin.MaxPlayers)
         {
-            if (__args[i] is int value && value < Plugin.MaxPlayers)
-            {
-                Plugin.ModLog?.LogDebug($"Raising multiplayer integer argument {value} -> {Plugin.MaxPlayers}.");
-                __args[i] = Plugin.MaxPlayers;
-            }
+            int old = value;
+            value = Plugin.MaxPlayers;
+            Plugin.ModLog?.LogInfo($"FORCED {argument}: {old} -> {value}");
         }
     }
+
+    // Positional Harmony arguments are used deliberately instead of object[] __args.
+    // This is substantially more reliable with BepInEx 6 + Il2CppInterop/HarmonySupport.
+    public static void ForceInt0(ref int __0) => Raise(ref __0, "int arg #0");
+    public static void ForceInt1(ref int __1) => Raise(ref __1, "int arg #1");
+    public static void ForceInt2(ref int __2) => Raise(ref __2, "int arg #2");
+    public static void ForceInt3(ref int __3) => Raise(ref __3, "int arg #3");
 
     public static void MinimumEightResult(ref int __result)
     {
         if (__result < Plugin.MaxPlayers)
+        {
+            int old = __result;
             __result = Plugin.MaxPlayers;
+            Plugin.ModLog?.LogInfo($"FORCED integer result: {old} -> {__result}");
+        }
+    }
+
+    // Steam/FishySteamworks still provides the hard ceiling of 8. This bypass only prevents
+    // game/UI-side 'lobby full' checks from rejecting players 5-8 before Steam gets a chance.
+    public static void ForceNotFull(ref bool __result)
+    {
+        if (__result)
+        {
+            __result = false;
+            Plugin.ModLog?.LogInfo("FORCED lobby Full result: true -> false");
+        }
     }
 }
