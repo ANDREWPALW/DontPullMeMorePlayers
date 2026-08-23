@@ -11,7 +11,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "andrewpalww.dontpullme.moreplayers";
     public const string PluginName = "Dont Pull Me More Players";
-    public const string PluginVersion = "1.0.6";
+    public const string PluginVersion = "1.0.7";
     public const int MaxPlayers = 8;
 
     internal static ManualLogSource? ModLog;
@@ -33,7 +33,7 @@ public sealed class Plugin : BasePlugin
         patched += PatchLobbyVisuals(_harmony);
 
         Log.LogInfo($"{PluginName}: installed {patched} Harmony patches.");
-        Log.LogInfo("v1.0.6 fixes typed rope cloning and expands lobby character slots for players 5-8.");
+        Log.LogInfo("v1.0.7 uses safe template-only rope expansion and incremental lobby visual slots.");
     }
 
     private static int PatchLobbyManager(Harmony harmony)
@@ -153,15 +153,14 @@ public sealed class Plugin : BasePlugin
         {
             foreach (MethodInfo method in DeclaredMethods(type))
             {
-                if (method.Name == "HandleServerCharacterSpawned")
-                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterPlayerSpawn));
+                if (method.Name == "Awake")
+                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterAwake));
                 else if (method.Name == "RebuildRopeChain")
-                    count += Patch(harmony, method, prefixName: nameof(Patches.RopeManagerBeforeRebuild),
-                                                   postfixName: nameof(Patches.RopeManagerAfterRebuild));
+                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterRebuild));
                 else if (method.Name == "SceneManager_OnLoadEnd")
                     count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterSceneLoad));
-                else if (method.Name == "DelayedRopeSetup")
-                    count += Patch(harmony, method, prefixName: nameof(Patches.RopeManagerBeforeDelayedSetup));
+                else if (method.Name == "HandleServerCharacterSpawned")
+                    count += Patch(harmony, method, postfixName: nameof(Patches.RopeManagerAfterPlayerSpawn));
             }
         }
         return count;
@@ -174,10 +173,14 @@ public sealed class Plugin : BasePlugin
         {
             foreach (MethodInfo method in DeclaredMethods(type))
             {
-                if (method.Name == "Start" || method.Name == "OpenPanel" || method.Name == "LobbyCreated")
-                    count += Patch(harmony, method, postfixName: nameof(Patches.LobbyPanelAfterSetup));
-                else if (method.Name == "LobbyJoinSuccess" || method.Name == "OtherUserJoined" || method.Name == "UserJoined")
-                    count += Patch(harmony, method, prefixName: nameof(Patches.LobbyPanelBeforeMemberEvent));
+                // Expand only when membership actually requires another visible slot.
+                // This avoids instantiating four extra LobbyPlayer objects during Start().
+                if (method.Name == "LobbyJoinSuccess")
+                    count += Patch(harmony, method, postfixName: nameof(Patches.LobbyPanelAfterJoinSuccess));
+                else if (method.Name == "OtherUserJoined")
+                    count += Patch(harmony, method, prefixName: nameof(Patches.LobbyPanelBeforeOtherUserJoined));
+                else if (method.Name == "UserJoined")
+                    count += Patch(harmony, method, prefixName: nameof(Patches.LobbyPanelBeforeUserJoined));
             }
         }
         return count;
@@ -310,49 +313,68 @@ internal static class Patches
         }
     }
 
-    // ---- Rope extension for players 5-8 ------------------------------------
-    // Stock RopeStack = 3 ObiRope segments + 4 edge transforms, which is exactly
-    // enough for 4 players.  For N players the chain needs N-1 ropes and N edges.
-    // v1.0.6 clones the *typed* IL2CPP component via generic Object.Instantiate<T>,
-    // avoiding the v1.0.5 UnityEngine.Object -> ObiRope conversion failure.
-    public static void RopeManagerAfterPlayerSpawn(object __instance)
-        => PrepareRopeManager(__instance, "player-spawn");
+    // ---- Safe rope extension for players 5-8 -------------------------------
+    // IMPORTANT: v1.0.6 cloned active ObiRope components in _currentRopeStack.
+    // Obi keeps native solver state, so cloning a live actor can crash Unity outside
+    // managed exception handling. v1.0.7 never mutates or clones the live stack.
+    // We extend only the serialized/template RopeStack before the live chain is built.
+    public static void RopeManagerAfterAwake(object __instance)
+        => PrepareRopeTemplate(__instance, "awake");
 
-    public static void RopeManagerBeforeRebuild(object __instance)
-        => PrepareRopeManager(__instance, "before-rebuild");
+    public static void RopeManagerAfterSceneLoad(object __instance)
+    {
+        // Scene changes can replace the template. Only touch it if no live rope stack
+        // exists yet; otherwise leave the current physical simulation completely alone.
+        PrepareRopeTemplate(__instance, "scene-load");
+        LogRopeState(__instance, "scene-load-state");
+    }
+
+    public static void RopeManagerAfterPlayerSpawn(object __instance)
+    {
+        // Diagnostics only. The game itself rebuilds the chain after spawning.
+        LogRopeState(__instance, "player-spawn");
+    }
 
     public static void RopeManagerAfterRebuild(object __instance)
         => LogRopeState(__instance, "after-rebuild");
 
-    public static void RopeManagerAfterSceneLoad(object __instance)
-        => PrepareRopeManager(__instance, "scene-load");
-
-    public static void RopeManagerBeforeDelayedSetup(object __instance)
-        => PrepareRopeManager(__instance, "delayed-setup");
-
-    private static void PrepareRopeManager(object manager, string reason)
+    private static void PrepareRopeTemplate(object manager, string reason)
     {
         try
         {
-            int players = GetCollectionCount(GetMember(manager, "_players"));
-            if (players > 0)
-                Plugin.ModLog?.LogInfo($"ROPE {reason}: players={players}");
-
-            if (players <= 4) return;
-
-            int requiredRopes = Math.Max(3, players - 1);
-            int requiredEdges = Math.Max(4, players);
+            object? current = GetMember(manager, "_currentRopeStack");
+            if (current != null)
+            {
+                Plugin.ModLog?.LogInfo($"ROPE {reason}: live stack already exists; template mutation skipped for safety.");
+                return;
+            }
 
             object? template = GetMember(manager, "ropeStack");
-            object? current = GetMember(manager, "_currentRopeStack");
+            if (template == null)
+            {
+                Plugin.ModLog?.LogWarning($"ROPE {reason}: ropeStack template is null.");
+                return;
+            }
 
-            if (template != null) EnsureStackCapacity(template, requiredRopes, requiredEdges, "template");
-            if (current != null && !ReferenceEquals(current, template))
-                EnsureStackCapacity(current, requiredRopes, requiredEdges, "current");
+            // Prepare the maximum supported template once: N players require N-1 ropes
+            // and N edge transforms. The runtime stack will then be created by the game.
+            int oldRopes = GetArrayLength(GetMember(template, "ropes"));
+            int oldEdges = GetArrayLength(GetMember(template, "ropeEdgeColliders"));
+            if (oldRopes >= Plugin.MaxPlayers - 1 && oldEdges >= Plugin.MaxPlayers)
+                return;
+
+            Plugin.ModLog?.LogInfo($"ROPE {reason}: preparing inactive template, ropes={oldRopes}, edges={oldEdges}.");
+
+            ExpandTemplateArrayMember(template, "ropes", Plugin.MaxPlayers - 1, "template.ropes");
+            ExpandTemplateArrayMember(template, "ropeEdgeColliders", Plugin.MaxPlayers, "template.ropeEdgeColliders");
+
+            Plugin.ModLog?.LogInfo(
+                $"ROPE TEMPLATE READY: ropes={GetArrayLength(GetMember(template, "ropes"))}, " +
+                $"edges={GetArrayLength(GetMember(template, "ropeEdgeColliders"))}");
         }
         catch (Exception ex)
         {
-            Plugin.ModLog?.LogWarning($"ROPE {reason}: capacity preparation failed: {ex.GetType().Name}: {ex.Message}");
+            Plugin.ModLog?.LogWarning($"ROPE {reason}: safe template preparation failed: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -361,10 +383,12 @@ internal static class Patches
         try
         {
             int players = GetCollectionCount(GetMember(manager, "_players"));
+            object? template = GetMember(manager, "ropeStack");
             object? current = GetMember(manager, "_currentRopeStack");
-            int ropes = current == null ? -1 : GetArrayLength(GetMember(current, "ropes"));
+            int templateRopes = template == null ? -1 : GetArrayLength(GetMember(template, "ropes"));
+            int currentRopes = current == null ? -1 : GetArrayLength(GetMember(current, "ropes"));
             int edges = current == null ? -1 : GetArrayLength(GetMember(current, "ropeEdgeColliders"));
-            Plugin.ModLog?.LogInfo($"ROPE {reason}: players={players}, currentRopes={ropes}, edgeColliders={edges}");
+            Plugin.ModLog?.LogInfo($"ROPE {reason}: players={players}, templateRopes={templateRopes}, currentRopes={currentRopes}, edgeColliders={edges}");
         }
         catch (Exception ex)
         {
@@ -372,23 +396,101 @@ internal static class Patches
         }
     }
 
-    private static void EnsureStackCapacity(object stack, int requiredRopes, int requiredEdges, string label)
+    private static void ExpandTemplateArrayMember(object owner, string memberName, int targetLength, string logicalName)
     {
-        ExpandReferenceArrayMember(stack, "ropes", requiredRopes, label, reposition: false);
-        ExpandReferenceArrayMember(stack, "ropeEdgeColliders", requiredEdges, label, reposition: false);
+        object? array = GetMember(owner, memberName);
+        if (array == null) return;
+        int oldLength = GetArrayLength(array);
+        if (oldLength <= 0 || oldLength >= targetLength) return;
+
+        Type arrayType = array.GetType();
+        MethodInfo? getter = arrayType.GetMethod("get_Item", BindingFlags.Public | BindingFlags.Instance);
+        MethodInfo? setter = arrayType.GetMethod("set_Item", BindingFlags.Public | BindingFlags.Instance);
+        if (getter == null || setter == null) return;
+
+        object? expanded = CreateIl2CppArray(arrayType, targetLength);
+        if (expanded == null) return;
+
+        for (int i = 0; i < oldLength; ++i)
+            setter.Invoke(expanded, new object?[] { i, getter.Invoke(array, new object[] { i }) });
+
+        object? source = getter.Invoke(array, new object[] { oldLength - 1 });
+        if (source == null) return;
+
+        object? previous = oldLength > 1 ? getter.Invoke(array, new object[] { oldLength - 2 }) : null;
+        for (int i = oldLength; i < targetLength; ++i)
+        {
+            object? clone = CloneTemplateElementSafely(source);
+            Type expected = setter.GetParameters()[1].ParameterType;
+            if (clone == null || !expected.IsInstanceOfType(clone))
+            {
+                Plugin.ModLog?.LogWarning($"{logicalName}: safe clone failed at {i}; original template left unchanged.");
+                return;
+            }
+
+            RepositionClone(previous, source, clone, i - oldLength + 1);
+            setter.Invoke(expanded, new object?[] { i, clone });
+            previous = source;
+            source = clone;
+        }
+
+        if (SetMember(owner, memberName, expanded))
+            Plugin.ModLog?.LogInfo($"ROPE TEMPLATE EXPANDED {logicalName}: {oldLength} -> {targetLength}");
     }
 
-    // ---- Lobby standing-character extension -------------------------------
-    // UILobbyPanel.lobbyPlayer is Il2CppReferenceArray<LobbyPlayer> and ships with
-    // four scene slots.  Steam can now admit players 5-8, so we create extra lobby
-    // character slots before member-join handling chooses a free slot.
-    public static void LobbyPanelAfterSetup(object __instance)
-        => EnsureLobbyPlayerSlots(__instance, "setup");
+    private static object? CloneTemplateElementSafely(object source)
+    {
+        // Clone the containing GameObject while it is inactive. For Obi components this
+        // prevents OnEnable/AddToSolver from registering the clone with the live native solver.
+        try
+        {
+            object? sourceGo = GetPropertyValue(source, "gameObject");
+            if (sourceGo == null)
+                return CloneUnityObjectTyped(source);
 
-    public static void LobbyPanelBeforeMemberEvent(object __instance)
-        => EnsureLobbyPlayerSlots(__instance, "member-event");
+            bool wasActive = ReadBoolProperty(sourceGo, "activeSelf");
+            if (wasActive) InvokeMethod(sourceGo, "SetActive", false);
 
-    private static void EnsureLobbyPlayerSlots(object panel, string reason)
+            object? sourceTransform = GetPropertyValue(sourceGo, "transform");
+            object? parent = sourceTransform == null ? null : GetPropertyValue(sourceTransform, "parent");
+            object? cloneGo = InstantiateUnityObject(sourceGo, parent);
+
+            if (wasActive) InvokeMethod(sourceGo, "SetActive", true);
+            if (cloneGo == null) return null;
+
+            // Template clones stay inactive. A later stock Instantiate of the whole RopeStack
+            // creates/activates the real simulation objects in the normal game path.
+            InvokeMethod(cloneGo, "SetActive", false);
+
+            if (source.GetType().FullName == "UnityEngine.Transform")
+                return GetPropertyValue(cloneGo, "transform");
+
+            MethodInfo? getComponent = cloneGo.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "GetComponent" && !m.IsGenericMethod &&
+                                     m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(Type));
+            object? component = getComponent?.Invoke(cloneGo, new object[] { source.GetType() });
+            return component;
+        }
+        catch (Exception ex)
+        {
+            Plugin.ModLog?.LogWarning($"Safe template clone failed for {source.GetType().FullName}: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    // ---- Incremental lobby standing-character extension -------------------
+    // v1.0.6 cloned 4 extra LobbyPlayer objects at Start(). v1.0.7 creates only
+    // the number of visual slots required by the current Steam lobby membership.
+    public static void LobbyPanelAfterJoinSuccess(object __instance)
+        => EnsureLobbyPlayerSlots(__instance, "join-success", additionalIncoming: 0);
+
+    public static void LobbyPanelBeforeOtherUserJoined(object __instance)
+        => EnsureLobbyPlayerSlots(__instance, "other-user-joined", additionalIncoming: 1);
+
+    public static void LobbyPanelBeforeUserJoined(object __instance)
+        => EnsureLobbyPlayerSlots(__instance, "user-joined", additionalIncoming: 0);
+
+    private static void EnsureLobbyPlayerSlots(object panel, string reason, int additionalIncoming)
     {
         try
         {
@@ -396,21 +498,22 @@ internal static class Patches
             if (array == null) return;
 
             int oldLength = GetArrayLength(array);
-            if (oldLength < 0 || oldLength >= Plugin.MaxPlayers) return;
+            if (oldLength <= 0 || oldLength >= Plugin.MaxPlayers) return;
 
-            if (oldLength == 0)
-            {
-                Plugin.ModLog?.LogWarning($"LOBBY {reason}: lobbyPlayer array is empty; cannot create extra visual slots.");
-                return;
-            }
+            int memberCount = GetLobbyMemberCount(panel);
+            int target = Math.Clamp(Math.Max(4, memberCount), 4, Plugin.MaxPlayers);
+            // Some Steam callbacks fire just before LobbyData.MemberCount is refreshed.
+            // In that narrow case reserve exactly one new slot, never several at once.
+            if (additionalIncoming > 0 && target <= oldLength && memberCount >= oldLength)
+                target = Math.Min(Plugin.MaxPlayers, oldLength + 1);
+            if (target <= oldLength) return;
 
-            if (ExpandReferenceArrayValue(array, Plugin.MaxPlayers, out object? expanded, reposition: true, logicalName: "lobbyPlayer"))
-            {
-                if (expanded != null && SetMember(panel, "lobbyPlayer", expanded))
-                    Plugin.ModLog?.LogInfo($"LOBBY EXPANDED standing-character slots: {oldLength} -> {Plugin.MaxPlayers}");
-                else
-                    Plugin.ModLog?.LogWarning($"LOBBY {reason}: expanded lobbyPlayer array could not be assigned.");
-            }
+            Plugin.ModLog?.LogInfo($"LOBBY {reason}: members={memberCount}, slots={oldLength}, requested={target}");
+
+            if (ExpandLobbyPlayerArray(array, target, out object? expanded) && expanded != null && SetMember(panel, "lobbyPlayer", expanded))
+                Plugin.ModLog?.LogInfo($"LOBBY EXPANDED standing-character slots: {oldLength} -> {target}");
+            else
+                Plugin.ModLog?.LogWarning($"LOBBY {reason}: safe incremental expansion failed; stock slots preserved.");
         }
         catch (Exception ex)
         {
@@ -418,24 +521,23 @@ internal static class Patches
         }
     }
 
-    private static void ExpandReferenceArrayMember(object owner, string memberName, int targetLength, string label, bool reposition)
+    private static int GetLobbyMemberCount(object panel)
     {
-        object? array = GetMember(owner, memberName);
-        if (array == null) return;
-
-        int oldLength = GetArrayLength(array);
-        if (oldLength <= 0 || oldLength >= targetLength) return;
-
-        if (!ExpandReferenceArrayValue(array, targetLength, out object? expanded, reposition, $"{label}.{memberName}"))
-            return;
-
-        if (expanded != null && SetMember(owner, memberName, expanded))
-            Plugin.ModLog?.LogInfo($"ROPE EXPANDED {label}.{memberName}: {oldLength} -> {targetLength}");
-        else
-            Plugin.ModLog?.LogWarning($"ROPE {label}.{memberName}: expanded array could not be assigned.");
+        try
+        {
+            object? lobby = GetMember(panel, "lobby");
+            if (lobby == null) return 0;
+            object? value = lobby.GetType().GetProperty("MemberCount", BindingFlags.Public | BindingFlags.Instance)?.GetValue(lobby)
+                         ?? lobby.GetType().GetProperty("memberCount", BindingFlags.Public | BindingFlags.Instance)?.GetValue(lobby);
+            if (value is int i) return i;
+            MethodInfo? getter = lobby.GetType().GetMethod("get_MemberCount", BindingFlags.Public | BindingFlags.Instance);
+            if (getter?.Invoke(lobby, null) is int j) return j;
+        }
+        catch { }
+        return 0;
     }
 
-    private static bool ExpandReferenceArrayValue(object array, int targetLength, out object? expanded, bool reposition, string logicalName)
+    private static bool ExpandLobbyPlayerArray(object array, int targetLength, out object? expanded)
     {
         expanded = null;
         int oldLength = GetArrayLength(array);
@@ -444,55 +546,149 @@ internal static class Patches
         Type arrayType = array.GetType();
         MethodInfo? getter = arrayType.GetMethod("get_Item", BindingFlags.Public | BindingFlags.Instance);
         MethodInfo? setter = arrayType.GetMethod("set_Item", BindingFlags.Public | BindingFlags.Instance);
-        if (getter == null || setter == null)
-        {
-            Plugin.ModLog?.LogWarning($"{logicalName}: array indexer not found ({arrayType.FullName}).");
-            return false;
-        }
-
-        object? source = null;
-        object? previous = null;
-        for (int i = oldLength - 1; i >= 0 && source == null; --i)
-        {
-            source = getter.Invoke(array, new object[] { i });
-            if (source != null && i > 0)
-                previous = getter.Invoke(array, new object[] { i - 1 });
-        }
-        if (source == null)
-        {
-            Plugin.ModLog?.LogWarning($"{logicalName}: no source element to clone.");
-            return false;
-        }
+        if (getter == null || setter == null) return false;
 
         expanded = CreateIl2CppArray(arrayType, targetLength);
-        if (expanded == null)
-        {
-            Plugin.ModLog?.LogWarning($"{logicalName}: could not allocate {arrayType.FullName}[{targetLength}].");
-            return false;
-        }
-
+        if (expanded == null) return false;
         for (int i = 0; i < oldLength; ++i)
             setter.Invoke(expanded, new object?[] { i, getter.Invoke(array, new object[] { i }) });
 
+        object? source = getter.Invoke(array, new object[] { oldLength - 1 });
+        object? previous = oldLength > 1 ? getter.Invoke(array, new object[] { oldLength - 2 }) : null;
+        if (source == null) return false;
+
         for (int i = oldLength; i < targetLength; ++i)
         {
-            object? clone = CloneUnityObjectTyped(source);
+            object? clone = CloneLobbyPlayerSafely(source);
             if (clone == null || !setter.GetParameters()[1].ParameterType.IsInstanceOfType(clone))
-            {
-                Plugin.ModLog?.LogWarning($"{logicalName}: typed clone failed at index {i}. Expected {setter.GetParameters()[1].ParameterType.FullName}, got {clone?.GetType().FullName ?? "null"}.");
                 return false;
-            }
 
-            if (reposition)
-                RepositionClone(previous, source, clone, i - oldLength + 1);
-
-            ResetLobbyCloneIfNeeded(clone);
+            RepositionClone(previous, source, clone, 1);
+            ResetLobbyCloneFields(clone);
             setter.Invoke(expanded, new object?[] { i, clone });
             previous = source;
             source = clone;
         }
-
         return true;
+    }
+
+    private static object? CloneLobbyPlayerSafely(object source)
+    {
+        try
+        {
+            object? go = GetPropertyValue(source, "gameObject");
+            if (go == null) return null;
+            object? transform = GetPropertyValue(go, "transform");
+            object? parent = transform == null ? null : GetPropertyValue(transform, "parent");
+            object? cloneGo = InstantiateUnityObject(go, parent);
+            if (cloneGo == null) return null;
+
+            MethodInfo? getComponent = cloneGo.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == "GetComponent" && !m.IsGenericMethod &&
+                                     m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(Type));
+            return getComponent?.Invoke(cloneGo, new object[] { source.GetType() });
+        }
+        catch (Exception ex)
+        {
+            Plugin.ModLog?.LogWarning($"LOBBY safe clone failed: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static void ResetLobbyCloneFields(object clone)
+    {
+        // Do not call LobbyPlayer.UserLeft() on a clone: it can invoke lobby/voice side effects.
+        // Clear only occupancy data so UILobbyPanel considers the slot free.
+        ResetMemberToDefault(clone, "userData");
+        ResetMemberToDefault(clone, "lobbyMemeberData");
+
+        try
+        {
+            object? nameText = GetMember(clone, "nameText");
+            if (nameText != null) SetMember(nameText, "text", string.Empty);
+        }
+        catch { }
+    }
+
+    private static void ResetMemberToDefault(object owner, string name)
+    {
+        Type t = owner.GetType();
+        try
+        {
+            PropertyInfo? p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (p != null && p.CanWrite)
+            {
+                object? value = p.PropertyType.IsValueType ? Activator.CreateInstance(p.PropertyType) : null;
+                p.SetValue(owner, value);
+                return;
+            }
+        }
+        catch { }
+        try
+        {
+            FieldInfo? f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (f != null)
+            {
+                object? value = f.FieldType.IsValueType ? Activator.CreateInstance(f.FieldType) : null;
+                f.SetValue(owner, value);
+            }
+        }
+        catch { }
+    }
+
+    private static object? InstantiateUnityObject(object original, object? parent)
+    {
+        Type? unityObject = FindLoadedType("UnityEngine.Object");
+        if (unityObject == null) return null;
+        Type originalType = original.GetType();
+
+        foreach (MethodInfo def in unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                     .Where(m => m.Name == "Instantiate" && m.IsGenericMethodDefinition))
+        {
+            MethodInfo method;
+            try { method = def.MakeGenericMethod(originalType); }
+            catch { continue; }
+            ParameterInfo[] pp = method.GetParameters();
+            try
+            {
+                if (pp.Length == 2 && parent != null && pp[1].ParameterType.FullName == "UnityEngine.Transform")
+                {
+                    object? result = method.Invoke(null, new[] { original, parent });
+                    if (result != null) return result;
+                }
+                if (pp.Length == 1)
+                {
+                    object? result = method.Invoke(null, new[] { original });
+                    if (result != null) return result;
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static bool ReadBoolProperty(object owner, string name)
+    {
+        try
+        {
+            object? v = owner.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(owner);
+            return v is bool b && b;
+        }
+        catch { return false; }
+    }
+
+    private static object? InvokeMethod(object owner, string name, params object?[] args)
+    {
+        try
+        {
+            foreach (MethodInfo m in owner.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                if (m.Name != name || m.GetParameters().Length != args.Length) continue;
+                try { return m.Invoke(owner, args); } catch { }
+            }
+        }
+        catch { }
+        return null;
     }
 
     private static object? CreateIl2CppArray(Type arrayType, int length)
@@ -517,28 +713,16 @@ internal static class Patches
         {
             Type? unityObject = FindLoadedType("UnityEngine.Object");
             if (unityObject == null) return null;
-
-            object? transform = GetTransform(original);
-            object? parent = transform == null ? null : GetPropertyValue(transform, "parent");
-
-            // Prefer generic Instantiate<T>; its managed return value is T (ObiRope,
-            // Transform, LobbyPlayer, ...), not the base UnityEngine.Object wrapper.
             foreach (MethodInfo def in unityObject.GetMethods(BindingFlags.Public | BindingFlags.Static)
                          .Where(m => m.Name == "Instantiate" && m.IsGenericMethodDefinition))
             {
                 MethodInfo method;
                 try { method = def.MakeGenericMethod(original.GetType()); }
                 catch { continue; }
-
-                ParameterInfo[] p = method.GetParameters();
+                ParameterInfo[] pp = method.GetParameters();
                 try
                 {
-                    if (p.Length == 2 && parent != null && p[1].ParameterType.FullName == "UnityEngine.Transform")
-                    {
-                        object? result = method.Invoke(null, new[] { original, parent });
-                        if (result != null && original.GetType().IsInstanceOfType(result)) return result;
-                    }
-                    else if (p.Length == 1)
+                    if (pp.Length == 1)
                     {
                         object? result = method.Invoke(null, new[] { original });
                         if (result != null && original.GetType().IsInstanceOfType(result)) return result;
@@ -546,15 +730,9 @@ internal static class Patches
                 }
                 catch { }
             }
-
-            Plugin.ModLog?.LogWarning($"Typed Unity clone unavailable for {original.GetType().FullName}.");
-            return null;
         }
-        catch (Exception ex)
-        {
-            Plugin.ModLog?.LogWarning($"Typed Unity clone failed for {original.GetType().FullName}: {ex.GetType().Name}: {ex.Message}");
-            return null;
-        }
+        catch { }
+        return null;
     }
 
     private static object? GetTransform(object value)
@@ -565,7 +743,6 @@ internal static class Patches
             if (p != null) return p.GetValue(value);
         }
         catch { }
-
         if (value.GetType().FullName == "UnityEngine.Transform") return value;
         return null;
     }
@@ -597,7 +774,6 @@ internal static class Patches
             float sy = ReadFloatMember(srcPos, "y");
             float sz = ReadFloatMember(srcPos, "z");
             float dx = 1.6f, dy = 0f, dz = 0f;
-
             if (prevPos != null)
             {
                 dx = sx - ReadFloatMember(prevPos, "x");
@@ -610,12 +786,12 @@ internal static class Patches
             Type vectorType = srcPos.GetType();
             ConstructorInfo? ctor = vectorType.GetConstructor(new[] { typeof(float), typeof(float), typeof(float) });
             if (ctor == null) return;
-            object newPos = ctor.Invoke(new object[] { sx + dx, sy + dy, sz + dz });
+            object newPos = ctor.Invoke(new object[] { sx + dx * step, sy + dy * step, sz + dz * step });
             cloneLp.SetValue(cloneTransform, newPos);
         }
         catch (Exception ex)
         {
-            Plugin.ModLog?.LogWarning($"LOBBY clone reposition failed: {ex.Message}");
+            Plugin.ModLog?.LogWarning($"Clone reposition failed: {ex.Message}");
         }
     }
 
@@ -631,23 +807,6 @@ internal static class Patches
         }
         catch { }
         return 0f;
-    }
-
-    private static void ResetLobbyCloneIfNeeded(object clone)
-    {
-        // Only LobbyPlayer exposes UserLeft(). Calling it on a freshly cloned empty
-        // slot is harmless; if expansion happens late, it prevents duplicating the
-        // 4th player's user data/skin into the new slot.
-        if (clone.GetType().Name != "LobbyPlayer") return;
-        try
-        {
-            MethodInfo? userLeft = clone.GetType().GetMethod("UserLeft", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
-            userLeft?.Invoke(clone, null);
-        }
-        catch (Exception ex)
-        {
-            Plugin.ModLog?.LogWarning($"LOBBY cloned slot reset failed: {ex.Message}");
-        }
     }
 
     private static Type? FindLoadedType(string fullName)
