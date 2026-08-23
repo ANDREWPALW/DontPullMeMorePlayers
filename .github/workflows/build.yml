@@ -34,12 +34,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path package\DontPullMeMorePlayers | Out-Null
           Copy-Item bin\Release\net6.0\DontPullMeMorePlayers.dll package\DontPullMeMorePlayers\DontPullMeMorePlayers.dll
           Copy-Item README.md package\DontPullMeMorePlayers\README.txt
-          Compress-Archive -Path package\DontPullMeMorePlayers -DestinationPath DontPullMeMorePlayers_8Players_v1.0.7.zip -Force
+          Compress-Archive -Path package\DontPullMeMorePlayers -DestinationPath DontPullMeMorePlayers_8Players_v1.0.8.zip -Force
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DontPullMeMorePlayers-v1.0.7
+          name: DontPullMeMorePlayers-v1.0.8
           path: |
             package/DontPullMeMorePlayers/DontPullMeMorePlayers.dll
-            DontPullMeMorePlayers_8Players_v1.0.7.zip
+            DontPullMeMorePlayers_8Players_v1.0.8.zip
           if-no-files-found: error
