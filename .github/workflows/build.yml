@@ -1,4 +1,4 @@
-name: Build Dont Pull Me More Players
+name: Build Dont Pull Me More Players SAFE DIAGNOSTIC
 
 on:
   workflow_dispatch:
@@ -34,12 +34,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path package\DontPullMeMorePlayers | Out-Null
           Copy-Item bin\Release\net6.0\DontPullMeMorePlayers.dll package\DontPullMeMorePlayers\DontPullMeMorePlayers.dll
           Copy-Item README.md package\DontPullMeMorePlayers\README.txt
-          Compress-Archive -Path package\DontPullMeMorePlayers -DestinationPath DontPullMeMorePlayers_8Players_v1.0.8.zip -Force
+          Compress-Archive -Path package\DontPullMeMorePlayers -DestinationPath DontPullMeMorePlayers_SAFE_DIAGNOSTIC_v1.0.9.zip -Force
       - name: Upload DLL artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DontPullMeMorePlayers-v1.0.8
+          name: DontPullMeMorePlayers-SAFE-DIAGNOSTIC-v1.0.9
           path: |
             package/DontPullMeMorePlayers/DontPullMeMorePlayers.dll
-            DontPullMeMorePlayers_8Players_v1.0.8.zip
+            DontPullMeMorePlayers_SAFE_DIAGNOSTIC_v1.0.9.zip
           if-no-files-found: error
